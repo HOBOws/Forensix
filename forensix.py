@@ -212,6 +212,13 @@ MAGIC_SIGNATURES = [
     ("Java class",        "CAFEBABE",                   0, ".class",  "Java",       32,        0),
     ("DEX",               "6465780A",                   0, ".dex",    "Android",    112,       0),
     ("Torrent",           "6431303A",                   0, ".torrent","Other",      20,        0),
+    # ── FORENSIX custom embed markers ───────────────────────────────────────
+    ("FORENSIX WAV embed",   "3C3C464F52454E5349585F57415656",  0, ".wav", "Audio",    0, 0),
+    ("FORENSIX PNG embed",   "3C3C464F52454E5349585F504E47",    0, ".png", "Image",    0, 0),
+    ("FORENSIX TXT embed",   "3C3C464F52454E5349585F545854",    0, ".txt", "Text",     0, 0),
+    ("FORENSIX Script embed","3C3C464F52454E5349585F4D414C",    0, ".py",  "Executable",0,0),
+    ("FORENSIX PDF embed",   "3C3C464F52454E5349585F504446",    0, ".pdf", "Document", 0, 0),
+    ("FORENSIX DOCX embed",  "3C3C464F52454E5349585F444F43",    0, ".docx","Document", 0, 0),
 ]
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -326,7 +333,12 @@ class AnalysisEngine:
         png_data_end   = -1
         if self.data[:8] == bytes.fromhex("89504E470D0A1A0A"):
             idat = self.data.find(b'IDAT')
-            iend = self.data.rfind(b'IEND')
+            # Use the FIRST IEND (not rfind) so appended data after PNG
+            # doesn't extend the suppression window into embedded files.
+            # Search only within the first 95% of the file to avoid
+            # catching IEND markers inside appended embedded PNGs.
+            search_limit = int(len(self.data) * 0.95)
+            iend = self.data.find(b'IEND', 0, search_limit)
             if idat != -1 and iend != -1:
                 png_data_start = idat
                 png_data_end   = iend + 12
@@ -430,20 +442,19 @@ class AnalysisEngine:
 
         findings.sort(key=lambda x: x["offset"])
 
-        # Collapse duplicates
+        # Collapse duplicates that are CLOSE together (within 512KB)
+        # Far-apart hits of the same type are kept — they are different files
+        COLLAPSE_WINDOW = 524288  # 512 KB
         collapsed = []
-        counts    = {}
         for f in findings:
-            key = f["name"]
-            if key not in counts:
-                counts[key] = 0
+            merged = False
+            for c in collapsed:
+                if c["name"] == f["name"] and abs(f["offset"] - c["offset"]) < COLLAPSE_WINDOW:
+                    c["dup_count"] = c.get("dup_count", 0) + 1
+                    merged = True
+                    break
+            if not merged:
                 collapsed.append(f)
-            else:
-                counts[key] += 1
-                for c in collapsed:
-                    if c["name"] == key:
-                        c["dup_count"] = counts[key]
-                        break
 
         # Deduplicate very close offsets (within 16 bytes)
         deduped, last = [], -9999
@@ -477,6 +488,9 @@ class AnalysisEngine:
                     "WAV", "MP3 ID3", "MKV"}
         if name in reliable:
             score += 2
+        # FORENSIX embed markers are always real
+        if name.startswith("FORENSIX "):
+            score += 3
 
         if score >= 5:
             return "HIGH"
@@ -519,7 +533,7 @@ class AnalysisEngine:
                                  "offset": f"0x{jpeg_eoi+2:X}",
                                  "detail": f"{extra:,} bytes after JPEG End-Of-Image marker"})
 
-        png_iend = data.rfind(b'IEND\xAE\x42\x60\x82')
+        png_iend = data.find(b'IEND\xAE\x42\x60\x82')
         if png_iend != -1 and png_iend + 8 < size:
             extra = size - png_iend - 8
             if extra > 0:
